@@ -1,4 +1,4 @@
-import os
+ import os
 import requests
 import pandas as pd
 import yfinance as yf
@@ -7,12 +7,19 @@ import yfinance as yf
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID")
 
+# 欲掃描的台股清單 (可自行增減標的，台股加上 .TW 或 .TWO)
+STOCK_LIST = [
+    "2330.TW", "2317.TW", "2454.TW", "2308.TW", "2382.TW",
+    "3231.TW", "2356.TW", "3037.TW", "2379.TW", "6669.TW",
+    "3035.TW", "3661.TW", "2408.TW", "3008.TW", "2303.TW"
+]
+
 def send_telegram_msg(message):
     """發送訊息至 Telegram Bot"""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("未設定 Telegram Token 或 Chat ID，跳過推播。")
-        print(message)
+        print("缺少 TELEGRAM_TOKEN 或 TELEGRAM_CHAT_ID 設定！")
         return
+    
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -20,71 +27,75 @@ def send_telegram_msg(message):
         "parse_mode": "Markdown"
     }
     try:
-        response = requests.post(url, json=payload, timeout=10)
-        response.raise_for_status()
+        res = requests.post(url, json=payload, timeout=10)
+        res.raise_for_status()
+        print("Telegram 發送成功！")
     except Exception as e:
-        print(f"Telegram 推播失敗: {e}")
+        print(f"Telegram 發送失敗: {e}")
 
-def check_vcp(ticker_symbol):
-    """檢查單一股票是否符合 VCP 趨勢與波幅收縮條件"""
+def check_vcp(ticker):
+    """檢查單一股票是否符合 VCP 型態基本條件"""
     try:
-        df = yf.download(ticker_symbol, period="1y", interval="1d", progress=False)
-        if df.empty or len(df) < 200:
+        stock = yf.Ticker(ticker)
+        df = stock.history(period="1y")
+        
+        if len(df) < 200:
             return None
 
-        # 處理多層索引欄位 (yfinance 升級後特有結構)
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = df.columns.get_level_values(0)
+        # 計算移動平均線
+        df['MA20'] = df['Close'].rolling(window=20).mean()
+        df['MA50'] = df['Close'].rolling(window=50).mean()
+        df['MA200'] = df['Close'].rolling(window=200).mean()
 
-        close = df['Close']
-        ma50 = close.rolling(50).mean()
-        ma200 = close.rolling(200).mean()
+        latest = df.iloc[-1]
+        close = latest['Close']
+        ma20 = latest['MA20']
+        ma50 = latest['MA50']
+        ma200 = latest['MA200']
 
-        curr_price = close.iloc[-1]
-        curr_ma50 = ma50.iloc[-1]
-        curr_ma200 = ma200.iloc[-1]
-
-        # 1. 趨勢過濾：股價高於 50MA 與 200MA，且 50MA 高於 200MA
-        if not (curr_price > curr_ma50 > curr_ma200):
+        # 1. 趨勢條件：股價高於 50MA 與 200MA，且 50MA > 200MA
+        if not (close > ma50 and close > ma200 and ma50 > ma200):
             return None
 
-        # 2. 波動收縮 (VCP) 簡化判定：近期 20 日波幅小於前 60 日波幅
-        high20, low20 = df['High'].iloc[-20:].max(), df['Low'].iloc[-20:].min()
-        high60, low60 = df['High'].iloc[-60:].max(), df['Low'].iloc[-60:].min()
+        # 2. 距離 52 週高點 25% 以內 (處於高檔整理)
+        high_52w = df['High'].tail(252).max()
+        if close < high_52w * 0.75:
+            return None
 
-        volatility_20 = (high20 - low20) / low20
-        volatility_60 = (high60 - low60) / low60
+        # 3. 近期 20 日波動度收縮 (計算高低價差比例)
+        recent_20 = df.tail(20)
+        volatility_20 = (recent_20['High'].max() - recent_20['Low'].min()) / recent_20['Low'].min()
 
-        if volatility_20 < (volatility_60 * 0.6):  # 收縮幅度顯著降低
+        # 近 10 日波動度要小於近 20 日波動度 (波動持續收縮)
+        recent_10 = df.tail(10)
+        volatility_10 = (recent_10['High'].max() - recent_10['Low'].min()) / recent_10['Low'].min()
+
+        if volatility_10 < volatility_20 and volatility_10 < 0.12:  # 10日波幅在 12% 以內
             return {
-                "ticker": ticker_symbol.replace(".TW", "").replace(".TWO", ""),
-                "price": round(curr_price, 2),
-                "volatility_20": f"{round(volatility_20 * 100, 1)}%"
+                "ticker": ticker.replace(".TW", "").replace(".TWO", ""),
+                "close": round(close, 2),
+                "volatility": round(volatility_10 * 100, 1),
+                "high_52w": round(high_52w, 2)
             }
     except Exception as e:
-        pass
+        print(f"掃描 {ticker} 時發生錯誤: {e}")
+    
     return None
 
-def main():
-    # 觀察標的清單（台股上市櫃熱門股範例，可依需求自行擴充）
-    watch_list = ["2330.TW", "2317.TW", "2454.TW", "2382.TW", "3231.TW", "2308.TW", "3037.TW"]
-    
-    selected_stocks = []
-    for ticker in watch_list:
-        res = check_vcp(ticker)
-        if res:
-            selected_stocks.append(res)
-
-    # 彙整推播報告
-    report = "📈 *每日台股 VCP 自動掃描報告*\n\n"
-    if selected_stocks:
-        report += "符合 200MA 趨勢 + 波動收縮條件之標的：\n"
-        for s in selected_stocks:
-            report += f"• *{s['ticker']}* | 收盤價: ${s['price']} | 近20日波幅: {s['volatility_20']}\n"
-    else:
-        report += "今日無符合 VCP 狹幅收縮條件之觀察標的。"
-
-    send_telegram_msg(report)
-
 if __name__ == "__main__":
-    main()
+    print("開始執行台股 VCP 掃描...")
+    matched_stocks = []
+
+    for ticker in STOCK_LIST:
+        result = check_vcp(ticker)
+        if result:
+            matched_stocks.append(
+                f"📈 *{result['ticker']}* - 現價: `${result['close']}` | 近10日波幅: `{result['volatility']}%`"
+            )
+
+    if matched_stocks:
+        msg = "🚀 **今日台股 VCP 篩選結果**\n\n" + "\n".join(matched_stocks)
+    else:
+        msg = "📊 **台股 VCP 每日掃描完成**\n今日追蹤清單中未發現符合 VCP 收縮型態之個股。"
+
+    send_telegram_msg(msg)
